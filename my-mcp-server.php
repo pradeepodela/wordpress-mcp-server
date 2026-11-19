@@ -2,16 +2,12 @@
 /**
  * Plugin Name: My MCP Server (key auth)
  * Description: Exposes a keyed MCP endpoint via the WordPress MCP Adapter.
- * Version:     1.0.0
- * Requires at least: 6.9
- * Requires PHP: 7.4
- * License:     MIT
  *
  * Endpoint:  https://YOUR-SITE/wp-json/my-plugin/mcp
  * Auth:      header  X-API-Key: <your key>   (or  ?key=<your key>  in the URL)
  *
  * Set your key in wp-config.php:  define( 'MY_MCP_KEY', 'long-random-secret' );
- * Or manage it from the admin: Settings -> MCP Server (auto-generates on activation).
+ * Until you do, it falls back to the inline default below.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -229,7 +225,9 @@ add_filter( 'determine_current_user', function ( $user_id ) {
 		return $user_id;
 	}
 	$key = $_SERVER['HTTP_X_API_KEY'] ?? ( $_GET['key'] ?? '' );
-	if ( empty( $key ) || ! hash_equals( my_mcp_expected_key(), $key ) ) {
+	// Reject non-string (e.g. crafted ?key[]=...) so hash_equals() never gets an
+	// array and fatals the whole request with a TypeError.
+	if ( ! is_string( $key ) || '' === $key || ! hash_equals( my_mcp_expected_key(), $key ) ) {
 		return $user_id;
 	}
 	$admins = get_users( [ 'role' => 'administrator', 'number' => 1, 'fields' => 'ID' ] );
@@ -667,20 +665,73 @@ add_action( 'wp_abilities_api_init', function () {
 } );
 
 /* ------------------------------------------------------------------ *
- * The MCP server, gated by the key
+ * The MCP server, gated by the key.
+ *
+ * Registration is made fail-safe: the MCP Adapter's create_server()
+ * signature has varied across versions (the observability-handler and
+ * transport-permission-callback parameters were added over time). Passing
+ * positional args that don't match the *installed* adapter can throw a fatal
+ * during rest_api_init and take down the ENTIRE WordPress REST API (every
+ * /wp-json route, not just this one). To avoid that we:
+ *   1. map our values to the adapter's real parameters by NAME via reflection,
+ *      so the call adapts to whatever signature is installed;
+ *   2. wrap everything in try/catch( \Throwable ) so a failure degrades to a
+ *      disabled MCP server instead of a 500 for all of REST;
+ *   3. record the outcome in the `my_mcp_last_init` option, readable via the
+ *      key-gated GET /wp-json/my-plugin/diag route below.
  * ------------------------------------------------------------------ */
 add_action( 'mcp_adapter_init', function ( $adapter ) {
-	$adapter->create_server(
-		'my-key-server',
-		'my-plugin',
-		'mcp',
-		'My Keyed MCP Server',
-		'MCP server with API-key auth',
-		'1.0.0',
-		[ \WP\MCP\Transport\HttpTransport::class ],
-		\WP\MCP\Infrastructure\ErrorHandling\ErrorLogMcpErrorHandler::class,
-		\WP\MCP\Infrastructure\Observability\NullMcpObservabilityHandler::class,
-		[
+
+	$remember = function ( $status ) {
+		// Only write when it actually changes, to avoid a DB write per request.
+		if ( get_option( 'my_mcp_last_init' ) !== $status ) {
+			update_option( 'my_mcp_last_init', $status, false );
+		}
+	};
+
+	try {
+		if ( ! is_object( $adapter ) || ! method_exists( $adapter, 'create_server' ) ) {
+			$remember( 'error: $adapter has no create_server()' );
+			return;
+		}
+
+		// Resolve classes by name, tolerating namespace/renames across versions.
+		$pick = function ( array $candidates ) {
+			foreach ( $candidates as $c ) {
+				if ( class_exists( $c ) ) {
+					return $c;
+				}
+			}
+			return null;
+		};
+
+		$transport = $pick( [
+			'\\WP\\MCP\\Transport\\HttpTransport',
+			'\\WP\\MCP\\Transport\\Http\\RestTransport',
+			'\\WP\\MCP\\Transport\\RestTransport',
+		] );
+		if ( null === $transport ) {
+			$remember( 'error: no known HTTP transport class found' );
+			return;
+		}
+
+		$error_handler = $pick( [
+			'\\WP\\MCP\\Infrastructure\\ErrorHandling\\ErrorLogMcpErrorHandler',
+		] ); // null is acceptable; adapter falls back to its Null handler.
+
+		$observability_handler = $pick( [
+			'\\WP\\MCP\\Infrastructure\\Observability\\NullMcpObservabilityHandler',
+		] );
+
+		$permission_cb = function ( $request ) {
+			$key = $request->get_header( 'X-API-Key' );
+			if ( empty( $key ) ) {
+				$key = $request->get_param( 'key' );
+			}
+			return is_string( $key ) && '' !== $key && hash_equals( my_mcp_expected_key(), $key );
+		};
+
+		$tools = [
 			'my-plugin/get-site-info',
 			'my-plugin/list-posts',
 			'my-plugin/get-post',
@@ -691,15 +742,111 @@ add_action( 'mcp_adapter_init', function ( $adapter ) {
 			'my-plugin/list-terms',
 			'my-plugin/upload-media',
 			'my-plugin/set-featured-image',
-		],
-		[],
-		[],
-		function ( $request ) {
+		];
+
+		// Values keyed by every parameter name the adapter has used across versions.
+		$by_name = [
+			'server_id'                     => 'my-key-server',
+			'server_route_namespace'        => 'my-plugin',
+			'server_route'                  => 'mcp',
+			'server_name'                   => 'My Keyed MCP Server',
+			'server_description'            => 'MCP server with API-key auth',
+			'server_version'                => '1.0.0',
+			'mcp_transports'                => [ $transport ],
+			'transports'                    => [ $transport ],
+			'error_handler'                 => $error_handler,
+			'mcp_error_handler'             => $error_handler,
+			'observability_handler'         => $observability_handler,
+			'mcp_observability_handler'     => $observability_handler,
+			'tools'                         => $tools,
+			'resources'                     => [],
+			'prompts'                       => [],
+			'transport_permission_callback' => $permission_cb,
+			'permission_callback'           => $permission_cb,
+			'check_permission'              => $permission_cb,
+			'mcp_transport_permission_callback' => $permission_cb,
+		];
+
+		$ref  = new ReflectionMethod( $adapter, 'create_server' );
+		$args = [];
+		foreach ( $ref->getParameters() as $p ) {
+			$name = $p->getName();
+			if ( array_key_exists( $name, $by_name ) ) {
+				$args[] = $by_name[ $name ];
+			} elseif ( $p->isOptional() ) {
+				$args[] = $p->isDefaultValueAvailable() ? $p->getDefaultValue() : null;
+			} elseif ( $p->allowsNull() ) {
+				$args[] = null;
+			} else {
+				$remember( 'error: unmapped required create_server() param "' . $name . '"' );
+				return;
+			}
+		}
+
+		$result = $ref->invokeArgs( $adapter, $args );
+
+		if ( is_wp_error( $result ) ) {
+			$remember( 'wp_error: ' . $result->get_error_code() . ' — ' . $result->get_error_message() );
+			return;
+		}
+		$remember( 'ok' );
+	} catch ( \Throwable $e ) {
+		$msg = 'throwable: ' . get_class( $e ) . ': ' . $e->getMessage()
+			. ' @ ' . $e->getFile() . ':' . $e->getLine();
+		$remember( $msg );
+		error_log( 'my-mcp create_server failed — ' . $msg );
+		// Swallowed on purpose: a broken MCP server must not 500 the whole REST API.
+	}
+}, 10 );
+
+/* ------------------------------------------------------------------ *
+ * Diagnostic route: GET /wp-json/my-plugin/diag  (key required)
+ * Reports PHP version, which adapter classes/signature are installed, and the
+ * last server-registration outcome — so failures can be read without server
+ * log access. Safe: read-only, key-gated, no secrets returned.
+ * ------------------------------------------------------------------ */
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'my-plugin', '/diag', [
+		'methods'             => 'GET',
+		'callback'            => 'my_mcp_diag',
+		'permission_callback' => function ( $request ) {
 			$key = $request->get_header( 'X-API-Key' );
 			if ( empty( $key ) ) {
 				$key = $request->get_param( 'key' );
 			}
-			return ! empty( $key ) && hash_equals( my_mcp_expected_key(), $key );
+			return is_string( $key ) && '' !== $key && hash_equals( my_mcp_expected_key(), $key );
+		},
+	] );
+}, 5 );
+
+function my_mcp_diag() {
+	$adapter_class = null;
+	foreach ( [ '\\WP\\MCP\\Core\\McpAdapter', '\\WP\\MCP\\McpAdapter' ] as $c ) {
+		if ( class_exists( $c ) ) {
+			$adapter_class = $c;
+			break;
 		}
-	);
-} );
+	}
+
+	$create_server_params = null;
+	if ( $adapter_class && method_exists( $adapter_class, 'create_server' ) ) {
+		$create_server_params = [];
+		foreach ( ( new ReflectionMethod( $adapter_class, 'create_server' ) )->getParameters() as $p ) {
+			$create_server_params[] = $p->getName() . ( $p->isOptional() ? '?' : '' );
+		}
+	}
+
+	return [
+		'php_version'          => PHP_VERSION,
+		'adapter_class'        => $adapter_class,
+		'create_server_params' => $create_server_params,
+		'classes'              => [
+			'HttpTransport'               => class_exists( '\\WP\\MCP\\Transport\\HttpTransport' ),
+			'RestTransport'               => class_exists( '\\WP\\MCP\\Transport\\Http\\RestTransport' ),
+			'ErrorLogMcpErrorHandler'     => class_exists( '\\WP\\MCP\\Infrastructure\\ErrorHandling\\ErrorLogMcpErrorHandler' ),
+			'NullMcpObservabilityHandler' => class_exists( '\\WP\\MCP\\Infrastructure\\Observability\\NullMcpObservabilityHandler' ),
+		],
+		'abilities_api'        => function_exists( 'wp_register_ability' ),
+		'last_init'            => get_option( 'my_mcp_last_init', '(never ran)' ),
+	];
+}
